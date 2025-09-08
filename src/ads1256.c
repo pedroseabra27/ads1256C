@@ -67,27 +67,36 @@ static int ads1256_rreg(int fd, uint8_t reg, uint8_t* value) {
 
 static int ads1256_wait_drdy(ads1256_t* dev, int timeout_ms) {
 #ifdef USE_GPIOD
-    struct timespec ts = { .tv_sec = timeout_ms/1000, .tv_nsec = (timeout_ms%1000)*1000000L };
-    struct gpiod_line_event ev;
-    int rc = gpiod_line_event_wait((struct gpiod_line*)dev->gpiod_line_drdy, &ts);
-    if (rc <= 0) return -1;
-    if (gpiod_line_event_read((struct gpiod_line*)dev->gpiod_line_drdy, &ev) < 0) return -1;
-    return 0;
-#else
-    // Timed fallback: just sleep a conservative time
+    if (dev->gpiod_line_drdy) {
+        // Poll for DRDY low
+        const int step_us = 200; // 0.2ms
+        int remaining_us = timeout_ms * 1000;
+        while (remaining_us > 0) {
+            int v = gpiod_line_get_value((struct gpiod_line*)dev->gpiod_line_drdy);
+            if (v == 0) return 0; // active low
+            usleep(step_us);
+            remaining_us -= step_us;
+        }
+        return -1;
+    }
+#endif
+    // Timed fallback: simple sleep
     (void)dev;
     int waited = 0;
     const int step = 1; // ms
     while (waited < timeout_ms) { usleep(step*1000); waited += step; }
     return 0;
-#endif
 }
 
 static int ads1256_read_data24(int fd, int32_t* out) {
-    uint8_t tx[4] = { ADS1256_CMD_RDATA, 0xFF, 0xFF, 0xFF };
-    uint8_t rx[4] = {0};
+    // Send RDATA command, then wait t6 (~50 tCLK) before reading 3 bytes
+    uint8_t cmd = ADS1256_CMD_RDATA;
+    if (spi_txrx(fd, &cmd, NULL, 1) != 0) return -1;
+    nsleep(10*1000); // ~10us
+    uint8_t tx[3] = {0xFF, 0xFF, 0xFF};
+    uint8_t rx[3] = {0};
     if (spi_txrx(fd, tx, rx, sizeof(tx)) != 0) return -1;
-    int32_t raw = ((int32_t)rx[1] << 16) | ((int32_t)rx[2] << 8) | rx[3];
+    int32_t raw = ((int32_t)rx[0] << 16) | ((int32_t)rx[1] << 8) | rx[2];
     if (raw & 0x800000) raw |= 0xFF000000; // sign extend 24-bit
     *out = raw;
     return 0;
@@ -126,14 +135,16 @@ int ads1256_open(ads1256_t* dev, const char* spi_path, int spi_speed_hz,
     dev->line_reset = reset_bcm;
 
 #ifdef USE_GPIOD
-    dev->gpiod_chip = gpiod_chip_open_by_number(gpiochip_index);
-    if (!dev->gpiod_chip) { perror("gpiod_chip_open_by_number"); return -1; }
-    dev->gpiod_line_drdy = gpiod_chip_get_line((struct gpiod_chip*)dev->gpiod_chip, drdy_bcm);
-    if (!dev->gpiod_line_drdy) { fprintf(stderr, "Failed to get DRDY line %d\n", drdy_bcm); return -1; }
-    if (gpiod_line_request_falling_edge_events((struct gpiod_line*)dev->gpiod_line_drdy, "ads1256") < 0) {
-        perror("gpiod_line_request_falling_edge_events"); return -1; }
-
+    if (drdy_bcm >= 0) {
+        dev->gpiod_chip = gpiod_chip_open_by_number(gpiochip_index);
+        if (!dev->gpiod_chip) { perror("gpiod_chip_open_by_number"); return -1; }
+        dev->gpiod_line_drdy = gpiod_chip_get_line((struct gpiod_chip*)dev->gpiod_chip, drdy_bcm);
+        if (!dev->gpiod_line_drdy) { fprintf(stderr, "Failed to get DRDY line %d\n", drdy_bcm); return -1; }
+        if (gpiod_line_request_input((struct gpiod_line*)dev->gpiod_line_drdy, "ads1256") < 0) {
+            perror("gpiod_line_request_input"); return -1; }
+    }
     if (reset_bcm >= 0) {
+        if (!dev->gpiod_chip) dev->gpiod_chip = gpiod_chip_open_by_number(gpiochip_index);
         dev->gpiod_line_reset = gpiod_chip_get_line((struct gpiod_chip*)dev->gpiod_chip, reset_bcm);
         if (!dev->gpiod_line_reset) { fprintf(stderr, "Failed to get RESET line %d\n", reset_bcm); return -1; }
         if (gpiod_line_request_output((struct gpiod_line*)dev->gpiod_line_reset, "ads1256", 1) < 0) { perror("gpiod_line_request_output"); return -1; }
@@ -143,12 +154,12 @@ int ads1256_open(ads1256_t* dev, const char* spi_path, int spi_speed_hz,
         gpiod_line_set_value((struct gpiod_line*)dev->gpiod_line_reset, 1);
         nsleep(50*1000*1000);
     } else {
-        // Send RESET command if no GPIO
+        // Send RESET command if no GPIO reset
         spi_write_cmd(dev->spi_fd, ADS1256_CMD_RESET);
         nsleep(50*1000*1000);
     }
 #else
-    // No libgpiod: just send RESET and sleep
+    // No libgpiod or disabled: just send RESET and sleep
     (void)gpiochip_index; (void)drdy_bcm; (void)reset_bcm;
     spi_write_cmd(dev->spi_fd, ADS1256_CMD_RESET);
     nsleep(50*1000*1000);
