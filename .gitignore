@@ -1,0 +1,16 @@
+# C/C++ build artifacts
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.obj
+*.pdb
+*.exe
+*.dll
+*.so
+*.dylib
+
+# VS Code
+.vscode/
