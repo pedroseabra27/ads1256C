@@ -1,0 +1,89 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <getopt.h>
+
+#include "sampler.h"
+
+static void print_usage(const char* prog){
+    printf("Usage: %s [options]\n", prog);
+    printf("  --spi PATH        SPI device (default /dev/spidev0.0)\n");
+    printf("  --speed HZ        SPI speed (default 1500000)\n");
+    printf("  --drdy N          BCM GPIO for DRDY (default 17)\n");
+    printf("  --reset N         BCM GPIO for RESET (-1 to disable, default 18)\n");
+    printf("  --chip N          gpiochip index (default 0)\n");
+    printf("  --vref V          reference voltage in volts (default 2.5)\n");
+    printf("  --pga N           PGA gain (1,2,4,8,16,32,64) default 1\n");
+    printf("  --drate SPS       target samples per second (per conversion) default 1000\n");
+    printf("  --frames N        capture N frames then exit (0=forever) default 10\n");
+}
+
+int main(int argc, char** argv){
+    const char* spi = "/dev/spidev0.0";
+    int speed = 1500000;
+    int drdy = 17;
+    int reset = 18;
+    int chip = 0;
+    double vref = 2.5;
+    int pga = 1;
+    int drate = 1000;
+    int frames = 10;
+
+    static struct option long_opts[] = {
+        {"spi", required_argument, 0, 0},
+        {"speed", required_argument, 0, 0},
+        {"drdy", required_argument, 0, 0},
+        {"reset", required_argument, 0, 0},
+        {"chip", required_argument, 0, 0},
+        {"vref", required_argument, 0, 0},
+        {"pga", required_argument, 0, 0},
+        {"drate", required_argument, 0, 0},
+        {"frames", required_argument, 0, 0},
+        {0,0,0,0}
+    };
+
+    while (1) {
+        int opt_index = 0;
+        int c = getopt_long(argc, argv, "", long_opts, &opt_index);
+        if (c == -1) break;
+        if (c == '?') { print_usage(argv[0]); return 1; }
+        if (c == 0) {
+            const char* name = long_opts[opt_index].name;
+            if (!strcmp(name, "spi")) spi = optarg;
+            else if (!strcmp(name, "speed")) speed = atoi(optarg);
+            else if (!strcmp(name, "drdy")) drdy = atoi(optarg);
+            else if (!strcmp(name, "reset")) reset = atoi(optarg);
+            else if (!strcmp(name, "chip")) chip = atoi(optarg);
+            else if (!strcmp(name, "vref")) vref = atof(optarg);
+            else if (!strcmp(name, "pga")) pga = atoi(optarg);
+            else if (!strcmp(name, "drate")) drate = atoi(optarg);
+            else if (!strcmp(name, "frames")) frames = atoi(optarg);
+        }
+    }
+
+    sampler_t s;
+    if (sampler_start(&s, spi, speed, chip, drdy, reset, pga, vref, drate, 256) != 0) {
+        fprintf(stderr, "Failed to start sampler. Are SPI and libgpiod available?\n");
+        return 1;
+    }
+
+    int remaining = frames;
+    while (frames == 0 || remaining-- > 0) {
+        ads1256_frame_t f;
+        // wait for a frame
+        int ok = 0;
+        for (int i=0;i<100;i++) { // wait up to ~1s
+            if (ads1256_ring_pop(&s.ring, &f)) { ok = 1; break; }
+            usleep(10000);
+        }
+        if (!ok) { fprintf(stderr, "Timeout waiting for frame\n"); break; }
+        printf("frame: ");
+        for (int i=0;i<8;i++) printf("%ld ", (long)f.ch[i]);
+        printf("\n");
+    }
+
+    sampler_stop(&s);
+    return 0;
+}
