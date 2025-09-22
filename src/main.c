@@ -23,6 +23,7 @@ static void print_usage(const char* prog){
     printf("  --frames N        capture N frames then exit (0=forever) default 10\n");
     printf("  --host IP         PC host IP to connect (default 127.0.0.1)\n");
     printf("  --port N          PC port to connect (default 12345)\n");
+    printf("  --burst N         send N frames per packet (default 1)\n");
 }
 
 int main(int argc, char** argv){
@@ -37,6 +38,7 @@ int main(int argc, char** argv){
     int frames = 10;
     const char* host = "127.0.0.1";
     int port = 12345;
+    int burst = 1;
 
     static struct option long_opts[] = {
         {"spi", required_argument, 0, 0},
@@ -48,6 +50,7 @@ int main(int argc, char** argv){
         {"pga", required_argument, 0, 0},
         {"drate", required_argument, 0, 0},
         {"frames", required_argument, 0, 0},
+        {"burst", required_argument, 0, 0},
         {"host", required_argument, 0, 0},
         {"port", required_argument, 0, 0},
         {0,0,0,0}
@@ -69,6 +72,7 @@ int main(int argc, char** argv){
             else if (!strcmp(name, "pga")) pga = atoi(optarg);
             else if (!strcmp(name, "drate")) drate = atoi(optarg);
             else if (!strcmp(name, "frames")) frames = atoi(optarg);
+            else if (!strcmp(name, "burst")) burst = atoi(optarg);
             else if (!strcmp(name, "host")) host = optarg;
             else if (!strcmp(name, "port")) port = atoi(optarg);
         }
@@ -105,30 +109,62 @@ int main(int argc, char** argv){
     }
     printf("Connected to %s:%d\n", host, port);
 
+    // Burst sending: send 'burst' frames per packet. burst==1 => original behavior (one frame per packet)
+    if (burst < 1) burst = 1;
+    size_t samples_per_packet = (size_t)burst * 8;
+    size_t packet_bytes = samples_per_packet * sizeof(int16_t);
     int remaining = frames;
-    while (frames == 0 || remaining-- > 0) {
-        ads1256_frame_t f;
-        // wait for a frame
-        int ok = 0;
-        for (int i=0;i<100;i++) { // wait up to ~1s
-            if (ads1256_ring_pop(&s.ring, &f)) { ok = 1; break; }
-            usleep(10000);
+
+    int running = 1;
+    // allocate buffer for converted samples
+    int16_t *packet_buf = malloc(packet_bytes);
+    if (!packet_buf) {
+        fprintf(stderr, "Failed to allocate packet buffer\n");
+        close(sock);
+        sampler_stop(&s);
+        return 1;
+    }
+
+    while (frames == 0 || remaining > 0) {
+        int to_collect = burst;
+        if (frames != 0 && remaining < burst) to_collect = remaining;
+
+        // collect 'to_collect' frames
+        int collected = 0;
+        for (int fidx = 0; fidx < to_collect; fidx++) {
+            ads1256_frame_t f;
+            // wait for a frame
+            int ok = 0;
+            for (int i=0;i<100;i++) { // wait up to ~1s
+                if (ads1256_ring_pop(&s.ring, &f)) { ok = 1; break; }
+                usleep(10000);
+            }
+            if (!ok) { fprintf(stderr, "Timeout waiting for frame\n"); running = 0; break; }
+
+            // convert and store into packet buffer
+            for (int ch = 0; ch < 8; ch++) {
+                int16_t v16 = (int16_t)(f.ch[ch] >> 8); // keep existing truncation behavior
+                packet_buf[(fidx*8) + ch] = htons(v16);
+            }
+            collected++;
+            if (frames != 0) remaining--;
         }
-        if (!ok) { fprintf(stderr, "Timeout waiting for frame\n"); break; }
-        
-        // Convert to 16-bit and send
-        int16_t buffer[8];
-        for (int i = 0; i < 8; i++) {
-            buffer[i] = htons((int16_t)(f.ch[i] >> 8));  // Convert 24-bit to 16-bit, network byte order
-        }
-        if (send(sock, buffer, sizeof(buffer), 0) < 0) {
+
+        if (collected == 0) break;
+
+        // send collected samples (collected * 8 * 2 bytes)
+        ssize_t to_send = (ssize_t)(collected * 8 * sizeof(int16_t));
+        if (send(sock, packet_buf, to_send, 0) < 0) {
             perror("send");
             break;
         }
-        
-        // Wait 10ms
-        usleep(10000);
+
+        // wait 10ms per frame collected to preserve original cadence
+        usleep(10000 * collected);
+        if (!running) break;
     }
+
+    free(packet_buf);
 
     close(sock);
     sampler_stop(&s);
