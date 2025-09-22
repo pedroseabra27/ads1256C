@@ -4,6 +4,9 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <getopt.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include "sampler.h"
 
@@ -18,6 +21,8 @@ static void print_usage(const char* prog){
     printf("  --pga N           PGA gain (1,2,4,8,16,32,64) default 1\n");
     printf("  --drate SPS       target samples per second (per conversion) default 1000\n");
     printf("  --frames N        capture N frames then exit (0=forever) default 10\n");
+    printf("  --host IP         PC host IP to connect (default 127.0.0.1)\n");
+    printf("  --port N          PC port to connect (default 12345)\n");
 }
 
 int main(int argc, char** argv){
@@ -30,6 +35,8 @@ int main(int argc, char** argv){
     int pga = 1;
     int drate = 1000;
     int frames = 10;
+    const char* host = "127.0.0.1";
+    int port = 12345;
 
     static struct option long_opts[] = {
         {"spi", required_argument, 0, 0},
@@ -41,6 +48,8 @@ int main(int argc, char** argv){
         {"pga", required_argument, 0, 0},
         {"drate", required_argument, 0, 0},
         {"frames", required_argument, 0, 0},
+        {"host", required_argument, 0, 0},
+        {"port", required_argument, 0, 0},
         {0,0,0,0}
     };
 
@@ -60,6 +69,8 @@ int main(int argc, char** argv){
             else if (!strcmp(name, "pga")) pga = atoi(optarg);
             else if (!strcmp(name, "drate")) drate = atoi(optarg);
             else if (!strcmp(name, "frames")) frames = atoi(optarg);
+            else if (!strcmp(name, "host")) host = optarg;
+            else if (!strcmp(name, "port")) port = atoi(optarg);
         }
     }
 
@@ -68,6 +79,31 @@ int main(int argc, char** argv){
         fprintf(stderr, "Failed to start sampler. Are SPI and libgpiod available?\n");
         return 1;
     }
+
+    // Connect to PC
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("socket");
+        sampler_stop(&s);
+        return 1;
+    }
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, host, &server_addr.sin_addr) <= 0) {
+        perror("inet_pton");
+        close(sock);
+        sampler_stop(&s);
+        return 1;
+    }
+    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        perror("connect");
+        close(sock);
+        sampler_stop(&s);
+        return 1;
+    }
+    printf("Connected to %s:%d\n", host, port);
 
     int remaining = frames;
     while (frames == 0 || remaining-- > 0) {
@@ -79,11 +115,22 @@ int main(int argc, char** argv){
             usleep(10000);
         }
         if (!ok) { fprintf(stderr, "Timeout waiting for frame\n"); break; }
-        printf("frame: ");
-        for (int i=0;i<8;i++) printf("%ld ", (long)f.ch[i]);
-        printf("\n");
+        
+        // Convert to 16-bit and send
+        int16_t buffer[8];
+        for (int i = 0; i < 8; i++) {
+            buffer[i] = htons((int16_t)(f.ch[i] >> 8));  // Convert 24-bit to 16-bit, network byte order
+        }
+        if (send(sock, buffer, sizeof(buffer), 0) < 0) {
+            perror("send");
+            break;
+        }
+        
+        // Wait 10ms
+        usleep(10000);
     }
 
+    close(sock);
     sampler_stop(&s);
     return 0;
 }
