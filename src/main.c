@@ -103,14 +103,14 @@ int main(int argc, char** argv){
     }
     printf("UDP socket ready to send to %s:%d\n", udp_host, port);
 
-    // Burst sending: send 'burst' frames per packet. burst==1 => original behavior (one frame per packet)
-    if (burst < 1) burst = 1;
-    size_t samples_per_packet = (size_t)burst * 8;
+    // Group 100 frames per packet
+    const int FRAMES_PER_PACKET = 100;
+    size_t samples_per_packet = (size_t)FRAMES_PER_PACKET * 8;
     size_t packet_bytes = samples_per_packet * sizeof(int16_t);
     int remaining = frames;
 
     int running = 1;
-    // allocate buffer for converted samples
+    // allocate buffer for converted samples (100 frames)
     int16_t *packet_buf = malloc(packet_bytes);
     if (!packet_buf) {
         fprintf(stderr, "Failed to allocate packet buffer\n");
@@ -119,43 +119,48 @@ int main(int argc, char** argv){
         return 1;
     }
 
+    int frames_in_buffer = 0; // track frames accumulated
+
     while (frames == 0 || remaining > 0) {
-        int to_collect = burst;
-        if (frames != 0 && remaining < burst) to_collect = remaining;
+        // collect 1 frame at a time
+        ads1256_frame_t f;
+        // wait for a frame
+        int ok = 0;
+        for (int i=0;i<100;i++) { // wait up to ~1s
+            if (ads1256_ring_pop(&s.ring, &f)) { ok = 1; break; }
+            usleep(10000);
+        }
+        if (!ok) { fprintf(stderr, "Timeout waiting for frame\n"); running = 0; break; }
 
-        // collect 'to_collect' frames
-        int collected = 0;
-        for (int fidx = 0; fidx < to_collect; fidx++) {
-            ads1256_frame_t f;
-            // wait for a frame
-            int ok = 0;
-            for (int i=0;i<100;i++) { // wait up to ~1s
-                if (ads1256_ring_pop(&s.ring, &f)) { ok = 1; break; }
-                usleep(10000);
-            }
-            if (!ok) { fprintf(stderr, "Timeout waiting for frame\n"); running = 0; break; }
+        // convert and store into packet buffer
+        for (int ch = 0; ch < 8; ch++) {
+            int16_t v16 = (int16_t)(f.ch[ch] >> 8); // keep existing truncation behavior
+            packet_buf[(frames_in_buffer*8) + ch] = htons(v16);
+        }
+        frames_in_buffer++;
+        if (frames != 0) remaining--;
 
-            // convert and store into packet buffer
-            for (int ch = 0; ch < 8; ch++) {
-                int16_t v16 = (int16_t)(f.ch[ch] >> 8); // keep existing truncation behavior
-                packet_buf[(fidx*8) + ch] = htons(v16);
+        // if buffer full (100 frames), send packet
+        if (frames_in_buffer >= FRAMES_PER_PACKET) {
+            ssize_t to_send = (ssize_t)(FRAMES_PER_PACKET * 8 * sizeof(int16_t));
+            if (sendto(sock, packet_buf, to_send, 0, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+                perror("sendto");
+                break;
             }
-            collected++;
-            if (frames != 0) remaining--;
+            frames_in_buffer = 0; // reset buffer
         }
 
-        if (collected == 0) break;
+        // wait 10ms per frame to preserve cadence
+        usleep(10000);
+        if (!running) break;
+    }
 
-        // send collected samples (collected * 8 * 2 bytes)
-        ssize_t to_send = (ssize_t)(collected * 8 * sizeof(int16_t));
+    // send any remaining frames if buffer not empty
+    if (frames_in_buffer > 0) {
+        ssize_t to_send = (ssize_t)(frames_in_buffer * 8 * sizeof(int16_t));
         if (sendto(sock, packet_buf, to_send, 0, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
             perror("sendto");
-            break;
         }
-
-        // wait 10ms per frame collected to preserve original cadence
-        usleep(10000 * collected);
-        if (!running) break;
     }
 
     free(packet_buf);
