@@ -21,8 +21,8 @@ static void print_usage(const char* prog){
     printf("  --pga N           PGA gain (1,2,4,8,16,32,64) default 1\n");
     printf("  --drate SPS       target samples per second (per conversion) default 1000\n");
     printf("  --frames N        capture N frames then exit (0=forever) default 10\n");
-    printf("  --host IP         PC host IP to connect (default 127.0.0.1)\n");
-    printf("  --port N          PC port to connect (default 12345)\n");
+    printf("  --udp-host IP     UDP host IP to send to (default 127.0.0.1)\n");
+    printf("  --port N          UDP port to send to (default 12345)\n");
     printf("  --burst N         send N frames per packet (default 1)\n");
 }
 
@@ -36,7 +36,7 @@ int main(int argc, char** argv){
     int pga = 1;
     int drate = 1000;
     int frames = 10;
-    const char* host = "127.0.0.1";
+    const char* udp_host = "127.0.0.1";
     int port = 12345;
     int burst = 1;
 
@@ -51,7 +51,7 @@ int main(int argc, char** argv){
         {"drate", required_argument, 0, 0},
         {"frames", required_argument, 0, 0},
         {"burst", required_argument, 0, 0},
-        {"host", required_argument, 0, 0},
+        {"udp-host", required_argument, 0, 0},
         {"port", required_argument, 0, 0},
         {0,0,0,0}
     };
@@ -73,7 +73,7 @@ int main(int argc, char** argv){
             else if (!strcmp(name, "drate")) drate = atoi(optarg);
             else if (!strcmp(name, "frames")) frames = atoi(optarg);
             else if (!strcmp(name, "burst")) burst = atoi(optarg);
-            else if (!strcmp(name, "host")) host = optarg;
+            else if (!strcmp(name, "udp-host")) udp_host = optarg;
             else if (!strcmp(name, "port")) port = atoi(optarg);
         }
     }
@@ -84,8 +84,8 @@ int main(int argc, char** argv){
         return 1;
     }
 
-    // Connect to PC
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    // Create UDP socket
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         perror("socket");
         sampler_stop(&s);
@@ -95,19 +95,13 @@ int main(int argc, char** argv){
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, host, &server_addr.sin_addr) <= 0) {
+    if (inet_pton(AF_INET, udp_host, &server_addr.sin_addr) <= 0) {
         perror("inet_pton");
         close(sock);
         sampler_stop(&s);
         return 1;
     }
-    if (connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("connect");
-        close(sock);
-        sampler_stop(&s);
-        return 1;
-    }
-    printf("Connected to %s:%d\n", host, port);
+    printf("UDP socket ready to send to %s:%d\n", udp_host, port);
 
     // Burst sending: send 'burst' frames per packet. burst==1 => original behavior (one frame per packet)
     if (burst < 1) burst = 1;
@@ -154,8 +148,8 @@ int main(int argc, char** argv){
 
         // send collected samples (collected * 8 * 2 bytes)
         ssize_t to_send = (ssize_t)(collected * 8 * sizeof(int16_t));
-        if (send(sock, packet_buf, to_send, 0) < 0) {
-            perror("send");
+        if (sendto(sock, packet_buf, to_send, 0, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+            perror("sendto");
             break;
         }
 
