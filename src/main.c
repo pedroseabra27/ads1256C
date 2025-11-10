@@ -7,8 +7,20 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <time.h>
 
 #include "sampler.h"
+
+// Header structure: 32 bytes
+typedef struct {
+    uint64_t timestamp_ns;  // Timestamp in nanoseconds
+    uint32_t packet_counter; // Sequential counter
+    uint32_t machine_id;    // Machine identifier
+    uint8_t padding[16];    // Padding to 32 bytes
+} packet_header_t;
+
+// Global packet counter
+static uint32_t global_packet_counter = 0;
 
 static void print_usage(const char* prog){
     printf("Usage: %s [options]\n", prog);
@@ -105,13 +117,14 @@ int main(int argc, char** argv){
 
     // Group 100 frames per packet
     const int FRAMES_PER_PACKET = 100;
-    size_t samples_per_packet = (size_t)FRAMES_PER_PACKET * 8;
-    size_t packet_bytes = samples_per_packet * sizeof(int16_t);
+    const int HEADER_SIZE = sizeof(packet_header_t);
+    size_t data_bytes = (size_t)FRAMES_PER_PACKET * 8 * sizeof(int16_t);
+    size_t packet_bytes = HEADER_SIZE + data_bytes;
     int remaining = frames;
 
     int running = 1;
-    // allocate buffer for converted samples (100 frames)
-    int16_t *packet_buf = malloc(packet_bytes);
+    // allocate buffer for header + converted samples (100 frames)
+    uint8_t *packet_buf = malloc(packet_bytes);
     if (!packet_buf) {
         fprintf(stderr, "Failed to allocate packet buffer\n");
         close(sock);
@@ -132,17 +145,27 @@ int main(int argc, char** argv){
         }
         if (!ok) { fprintf(stderr, "Timeout waiting for frame\n"); running = 0; break; }
 
-        // convert and store into packet buffer
+        // convert and store into packet buffer (after header)
+        int16_t *data_ptr = (int16_t*)(packet_buf + HEADER_SIZE);
         for (int ch = 0; ch < 8; ch++) {
             int16_t v16 = (int16_t)(f.ch[ch] >> 8); // keep existing truncation behavior
-            packet_buf[(frames_in_buffer*8) + ch] = htons(v16);
+            data_ptr[(frames_in_buffer*8) + ch] = htons(v16);
         }
         frames_in_buffer++;
         if (frames != 0) remaining--;
 
         // if buffer full (100 frames), send packet
         if (frames_in_buffer >= FRAMES_PER_PACKET) {
-            ssize_t to_send = (ssize_t)(FRAMES_PER_PACKET * 8 * sizeof(int16_t));
+            // Fill header
+            packet_header_t *hdr = (packet_header_t*)packet_buf;
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            hdr->timestamp_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+            hdr->packet_counter = global_packet_counter++;
+            hdr->machine_id = 1; // Fixed machine ID
+            memset(hdr->padding, 0, sizeof(hdr->padding));
+
+            ssize_t to_send = (ssize_t)packet_bytes;
             if (sendto(sock, packet_buf, to_send, 0, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
                 perror("sendto");
                 break;
@@ -157,7 +180,16 @@ int main(int argc, char** argv){
 
     // send any remaining frames if buffer not empty
     if (frames_in_buffer > 0) {
-        ssize_t to_send = (ssize_t)(frames_in_buffer * 8 * sizeof(int16_t));
+        // Fill header for partial packet
+        packet_header_t *hdr = (packet_header_t*)packet_buf;
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        hdr->timestamp_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+        hdr->packet_counter = global_packet_counter++;
+        hdr->machine_id = 1;
+        memset(hdr->padding, 0, sizeof(hdr->padding));
+
+        ssize_t to_send = HEADER_SIZE + (ssize_t)(frames_in_buffer * 8 * sizeof(int16_t));
         if (sendto(sock, packet_buf, to_send, 0, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
             perror("sendto");
         }
