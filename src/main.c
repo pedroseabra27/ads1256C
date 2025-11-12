@@ -20,7 +20,7 @@ typedef struct {
 } packet_header_t;
 
 // Global packet counter
-static uint32_t global_packet_counter = 65535;
+static uint32_t global_packet_counter = 0;
 
 static void print_usage(const char* prog){
     printf("Usage: %s [options]\n", prog);
