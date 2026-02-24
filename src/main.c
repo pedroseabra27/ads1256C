@@ -11,40 +11,42 @@
 
 #include "sampler.h"
 
-// Header structure: 32 bytes
+// Estrutura do header do pacote: 32 bytes
 typedef struct {
-    uint64_t timestamp_ns;  // Timestamp in nanoseconds
-    uint32_t packet_counter; // Sequential counter
-    uint32_t machine_id;    // Machine identifier
-    uint8_t padding[16];    // Padding to 32 bytes
+    uint64_t timestamp_ns;  // Timestamp em nanosegundos
+    uint32_t packet_counter; // Contador sequencial
+    uint32_t machine_id;    // ID da máquina
+    uint8_t padding[16];    // Padding para 32 bytes
 } packet_header_t;
 
-// Global packet counter
+// Contador global de pacotes
 static uint32_t global_packet_counter = 0;
 
+// Imprime o uso do programa
 static void print_usage(const char* prog){
     printf("Usage: %s [options]\n", prog);
-    printf("  --spi PATH        SPI device (default /dev/spidev0.0)\n");
-    printf("  --speed HZ        SPI speed (default 1500000)\n");
-    printf("  --drdy N          BCM GPIO for DRDY (default 17)\n");
-    printf("  --reset N         BCM GPIO for RESET (-1 to disable, default 18)\n");
-    printf("  --chip N          gpiochip index (default 0)\n");
-    printf("  --vref V          reference voltage in volts (default 2.5)\n");
-    printf("  --pga N           PGA gain (1,2,4,8,16,32,64) default 1\n");
-    printf("  --drate SPS       target samples per second (per conversion) default 1000\n");
-    printf("  --frames N        capture N frames then exit (0=forever) default 10\n");
-    printf("  --udp-host IP     UDP host IP to send to (default 127.0.0.1)\n");
-    printf("  --port N          UDP port to send to (default 12345)\n");
-    printf("  --burst N         send N frames per packet (default 1)\n");
+    printf("  --spi PATH        Dispositivo SPI (padrão /dev/spidev0.0)\n");
+    printf("  --speed HZ        Velocidade SPI (padrão 1500000)\n");
+    printf("  --drdy N          GPIO BCM para DRDY (padrão 17)\n");
+    printf("  --reset N         GPIO BCM para RESET (-1 para desabilitar, padrão 18)\n");
+    printf("  --chip N          Índice do gpiochip (padrão 0)\n");
+    printf("  --vref V          Tensão de referência em volts (padrão 2.5)\n");
+    printf("  --pga N           Ganho PGA (1,2,4,8,16,32,64) padrão 1\n");
+    printf("  --drate SPS       SPS alvo (por conversão) padrão 1000\n");
+    printf("  --frames N        Capturar N frames e sair (0=indefinidamente) padrão 10\n");
+    printf("  --udp-host IP     IP do host UDP para enviar (padrão 127.0.0.1)\n");
+    printf("  --port N          Porta UDP para enviar (padrão 12345)\n");
+    printf("  --burst N         Enviar N frames por pacote (padrão 1)\n");
 }
 
 int main(int argc, char** argv){
+    // Valores padrão
     const char* spi = "/dev/spidev0.0";
     int speed = 1500000;
     int drdy = 17;
     int reset = 18;
     int chip = 0;
-    double vref = 2.5;
+    double vref = 1.0;
     int pga = 1;
     int drate = 1000;
     int frames = 10;
@@ -52,6 +54,7 @@ int main(int argc, char** argv){
     int port = 12345;
     int burst = 1;
 
+    // Opções longas para getopt
     static struct option long_opts[] = {
         {"spi", required_argument, 0, 0},
         {"speed", required_argument, 0, 0},
@@ -68,6 +71,7 @@ int main(int argc, char** argv){
         {0,0,0,0}
     };
 
+    // Parsing dos argumentos
     while (1) {
         int opt_index = 0;
         int c = getopt_long(argc, argv, "", long_opts, &opt_index);
@@ -90,13 +94,14 @@ int main(int argc, char** argv){
         }
     }
 
+    // Iniciar o sampler
     sampler_t s;
     if (sampler_start(&s, spi, speed, chip, drdy, reset, pga, vref, drate, 256) != 0) {
-        fprintf(stderr, "Failed to start sampler. Are SPI and libgpiod available?\n");
+        fprintf(stderr, "Falha ao iniciar sampler. SPI e libgpiod disponíveis?\n");
         return 1;
     }
 
-    // Create UDP socket
+    // Criar socket UDP
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         perror("socket");
@@ -113,9 +118,9 @@ int main(int argc, char** argv){
         sampler_stop(&s);
         return 1;
     }
-    printf("UDP socket ready to send to %s:%d\n", udp_host, port);
+    printf("Socket UDP pronto para enviar para %s:%d\n", udp_host, port);
 
-    // Group 100 frames per packet
+    // Agrupar 100 frames por pacote
     const int FRAMES_PER_PACKET = 100;
     const int HEADER_SIZE = sizeof(packet_header_t);
     size_t data_bytes = (size_t)FRAMES_PER_PACKET * 8 * sizeof(int16_t);
@@ -123,46 +128,46 @@ int main(int argc, char** argv){
     int remaining = frames;
 
     int running = 1;
-    // allocate buffer for header + converted samples (100 frames)
+    // Alocar buffer para header + amostras convertidas (100 frames)
     uint8_t *packet_buf = malloc(packet_bytes);
     if (!packet_buf) {
-        fprintf(stderr, "Failed to allocate packet buffer\n");
+        fprintf(stderr, "Falha ao alocar buffer de pacote\n");
         close(sock);
         sampler_stop(&s);
         return 1;
     }
 
-    int frames_in_buffer = 0; // track frames accumulated
+    int frames_in_buffer = 0; // rastrear frames acumulados
 
     while (frames == 0 || remaining > 0) {
-        // collect 1 frame at a time
+        // Coletar 1 frame por vez
         ads1256_frame_t f;
-        // wait for a frame
+        // Esperar por um frame
         int ok = 0;
-        for (int i=0;i<100;i++) { // wait up to ~1s
+        for (int i=0;i<100;i++) { // esperar até ~1s
             if (ads1256_ring_pop(&s.ring, &f)) { ok = 1; break; }
             usleep(10000);
         }
-        if (!ok) { fprintf(stderr, "Timeout waiting for frame\n"); running = 0; break; }
+        if (!ok) { fprintf(stderr, "Timeout esperando frame\n"); running = 0; break; }
 
-        // convert and store into packet buffer (after header)
-        int16_t *data_ptr = (int16_t*)(packet_buf + HEADER_SIZE);
+        // Converter e armazenar no buffer de pacote (após header)
+        int16_t *data_ptr = (int16_t*)(packet_buf + HEADER_SIZE);   
         for (int ch = 0; ch < 8; ch++) {
-            int16_t v16 = (int16_t)(f.ch[ch] >> 8); // keep existing truncation behavior
+            int16_t v16 = (int16_t)(f.ch[ch] >> 8); // converter 24-bit para 16-bit
             data_ptr[(frames_in_buffer*8) + ch] = htons(v16);
         }
         frames_in_buffer++;
         if (frames != 0) remaining--;
 
-        // if buffer full (100 frames), send packet
+        // Se buffer cheio (100 frames), enviar pacote
         if (frames_in_buffer >= FRAMES_PER_PACKET) {
-            // Fill header
+            // Preencher header
             packet_header_t *hdr = (packet_header_t*)packet_buf;
             struct timespec ts;
             clock_gettime(CLOCK_MONOTONIC, &ts);
             hdr->timestamp_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
             hdr->packet_counter = global_packet_counter++;
-            hdr->machine_id = 1; // Fixed machine ID
+            hdr->machine_id = 1; // ID da máquina fixo
             memset(hdr->padding, 0, sizeof(hdr->padding));
 
             ssize_t to_send = (ssize_t)packet_bytes;
@@ -170,17 +175,17 @@ int main(int argc, char** argv){
                 perror("sendto");
                 break;
             }
-            frames_in_buffer = 0; // reset buffer
+            frames_in_buffer = 0; // resetar buffer
         }
 
-        // wait 10ms per frame to preserve cadence
+        // Esperar 10ms por frame para preservar cadência
         usleep(10000);
         if (!running) break;
     }
 
-    // send any remaining frames if buffer not empty
+    // Enviar frames restantes se buffer não vazio
     if (frames_in_buffer > 0) {
-        // Fill header for partial packet
+        // Preencher header para pacote parcial
         packet_header_t *hdr = (packet_header_t*)packet_buf;
         struct timespec ts;
         clock_gettime(CLOCK_MONOTONIC, &ts);
