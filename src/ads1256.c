@@ -16,26 +16,31 @@
 
 #include <linux/spi/spidev.h>
 
-// libgpiod optional
+// libgpiod opcional para controle eficiente de GPIOs
 #ifdef USE_GPIOD
 #include <gpiod.h>
 #endif
 
-#define CHECK(x) do { if(!(x)) { fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, #x); } } while(0)
+// Macro para verificações de debug
+#define CHECK(x) do { if(!(x)) { fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, #x); } while(0)
 
-static uint8_t spi_mode = SPI_MODE_1; // ADS1256 requires mode 1 (CPOL=0, CPHA=1)
+// Configurações padrão do SPI para ADS1256
+static uint8_t spi_mode = SPI_MODE_1; // ADS1256 requer modo 1 (CPOL=0, CPHA=1)
 static uint8_t spi_bits = 8;
-static uint32_t spi_speed = 1500000; // 1.5 MHz default
+static uint32_t spi_speed = 1500000; // 1.5 MHz padrão
 static uint16_t spi_delay = 0;
 
+// Função auxiliar para dormir em nanosegundos
 static inline void nsleep(long ns) {
     struct timespec ts; ts.tv_sec = ns/1000000000L; ts.tv_nsec = ns%1000000000L; nanosleep(&ts, NULL);
 }
 
+// Função para obter timestamp atual em nanosegundos
 static uint64_t now_ns(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec*1000000000ull + ts.tv_nsec;
 }
 
+// Função para transação SPI básica (envia e recebe dados)
 static int spi_txrx(int fd, const uint8_t* tx, uint8_t* rx, size_t len) {
     struct spi_ioc_transfer tr = {0};
     tr.tx_buf = (unsigned long)tx;
@@ -48,15 +53,18 @@ static int spi_txrx(int fd, const uint8_t* tx, uint8_t* rx, size_t len) {
     return ret < 1 ? -1 : 0;
 }
 
+// Envia um comando SPI simples
 static int spi_write_cmd(int fd, uint8_t cmd) {
     return spi_txrx(fd, &cmd, NULL, 1);
 }
 
+// Escreve em um registrador do ADS1256
 static int ads1256_wreg(int fd, uint8_t reg, uint8_t value) {
     uint8_t buf[3] = { ADS1256_CMD_WREG | (reg & 0x0F), 0x00, value };
     return spi_txrx(fd, buf, NULL, sizeof(buf));
 }
 
+// Lê de um registrador do ADS1256
 static int ads1256_rreg(int fd, uint8_t reg, uint8_t* value) {
     uint8_t tx[3] = { ADS1256_CMD_RREG | (reg & 0x0F), 0x00, 0xFF };
     uint8_t rx[3] = {0};
@@ -65,22 +73,23 @@ static int ads1256_rreg(int fd, uint8_t reg, uint8_t* value) {
     return rc;
 }
 
+// Espera pelo sinal DRDY (Data Ready) do ADS1256
 static int ads1256_wait_drdy(ads1256_t* dev, int timeout_ms) {
 #ifdef USE_GPIOD
     if (dev->gpiod_line_drdy) {
-        // Poll for DRDY low
+        // Polling para DRDY baixo (ativo)
         const int step_us = 200; // 0.2ms
         int remaining_us = timeout_ms * 1000;
         while (remaining_us > 0) {
             int v = gpiod_line_get_value((struct gpiod_line*)dev->gpiod_line_drdy);
-            if (v == 0) return 0; // active low
+            if (v == 0) return 0; // ativo baixo
             usleep(step_us);
             remaining_us -= step_us;
         }
         return -1;
     }
 #endif
-    // Timed fallback: simple sleep
+    // Fallback com sleep simples
     (void)dev;
     int waited = 0;
     const int step = 1; // ms
@@ -88,8 +97,9 @@ static int ads1256_wait_drdy(ads1256_t* dev, int timeout_ms) {
     return 0;
 }
 
+// Lê 24 bits de dados do ADS1256 após comando RDATA
 static int ads1256_read_data24(int fd, int32_t* out) {
-    // Send RDATA command, then wait t6 (~50 tCLK) before reading 3 bytes
+    // Envia RDATA, espera t6 (~50 tCLK) antes de ler 3 bytes
     uint8_t cmd = ADS1256_CMD_RDATA;
     if (spi_txrx(fd, &cmd, NULL, 1) != 0) return -1;
     nsleep(10*1000); // ~10us
@@ -97,14 +107,15 @@ static int ads1256_read_data24(int fd, int32_t* out) {
     uint8_t rx[3] = {0};
     if (spi_txrx(fd, tx, rx, sizeof(tx)) != 0) return -1;
     int32_t raw = ((int32_t)rx[0] << 16) | ((int32_t)rx[1] << 8) | rx[2];
-    if (raw & 0x800000) raw |= 0xFF000000; // sign extend 24-bit
+    if (raw & 0x800000) raw |= 0xFF000000; // extensão de sinal 24-bit
     *out = raw;
     return 0;
 }
 
+// Mapeia SPS (samples per second) para código DRATE do ADS1256
 static uint8_t drate_code_from_sps(int sps) {
-    // Simplified mapping; adjust if needed.
-    // Codes per datasheet Table 9 (typical): 30000..2.5 SPS
+    // Mapeamento simplificado; ajuste se necessário.
+    // Códigos por datasheet Table 9 (típico): 30000..2.5 SPS
     struct { int sps; uint8_t code; } map[] = {
         {30000, 0xF0}, {15000, 0xE0}, {7500, 0xD0}, {3750, 0xC0}, {2000, 0xB0}, {1000, 0xA1},
         {500, 0x92}, {100, 0x82}, {60, 0x72}, {50, 0x63}, {30, 0x53}, {25, 0x43}, {15, 0x33}, {10, 0x23}, {5, 0x13}, {2, 0x03}
@@ -117,6 +128,7 @@ static uint8_t drate_code_from_sps(int sps) {
     return map[best].code;
 }
 
+// Abre e inicializa o dispositivo ADS1256
 int ads1256_open(ads1256_t* dev, const char* spi_path, int spi_speed_hz,
                  int gpiochip_index, int drdy_bcm, int reset_bcm) {
     memset(dev, 0, sizeof(*dev));
@@ -129,7 +141,7 @@ int ads1256_open(ads1256_t* dev, const char* spi_path, int spi_speed_hz,
     if (ioctl(dev->spi_fd, SPI_IOC_WR_BITS_PER_WORD, &spi_bits) == -1) { perror("SPI_IOC_WR_BITS_PER_WORD"); return -1; }
     if (ioctl(dev->spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &spi_speed) == -1) { perror("SPI_IOC_WR_MAX_SPEED_HZ"); return -1; }
 
-    // libgpiod setup
+    // Configuração libgpiod
     dev->gpiochip_index = gpiochip_index;
     dev->line_drdy = drdy_bcm;
     dev->line_reset = reset_bcm;
@@ -148,29 +160,30 @@ int ads1256_open(ads1256_t* dev, const char* spi_path, int spi_speed_hz,
         dev->gpiod_line_reset = gpiod_chip_get_line((struct gpiod_chip*)dev->gpiod_chip, reset_bcm);
         if (!dev->gpiod_line_reset) { fprintf(stderr, "Failed to get RESET line %d\n", reset_bcm); return -1; }
         if (gpiod_line_request_output((struct gpiod_line*)dev->gpiod_line_reset, "ads1256", 1) < 0) { perror("gpiod_line_request_output"); return -1; }
-        // Hardware reset pulse
+        // Pulso de reset por hardware
         gpiod_line_set_value((struct gpiod_line*)dev->gpiod_line_reset, 0);
         nsleep(10*1000*1000);
         gpiod_line_set_value((struct gpiod_line*)dev->gpiod_line_reset, 1);
         nsleep(50*1000*1000);
     } else {
-        // Send RESET command if no GPIO reset
+        // Envia comando RESET se não há GPIO reset
         spi_write_cmd(dev->spi_fd, ADS1256_CMD_RESET);
         nsleep(50*1000*1000);
     }
 #else
-    // No libgpiod or disabled: just send RESET and sleep
+    // Sem libgpiod ou desabilitado: apenas envia RESET e dorme
     (void)gpiochip_index; (void)drdy_bcm; (void)reset_bcm;
     spi_write_cmd(dev->spi_fd, ADS1256_CMD_RESET);
     nsleep(50*1000*1000);
 #endif
 
-    // Stop any continuous conversion
+    // Para qualquer conversão contínua
     spi_write_cmd(dev->spi_fd, ADS1256_CMD_SDATAC);
 
     return 0;
 }
 
+// Fecha e libera recursos do dispositivo ADS1256
 void ads1256_close(ads1256_t* dev) {
     if (!dev) return;
     if (dev->spi_fd > 0) close(dev->spi_fd);
@@ -181,15 +194,16 @@ void ads1256_close(ads1256_t* dev) {
     #endif
 }
 
+// Configura o ADS1256 com PGA, Vref e DRATE
 int ads1256_configure(ads1256_t* dev, int pga_gain, double vref_volts, int drate_sps) {
     if (pga_gain<=0) pga_gain=1;
     dev->pga_gain = pga_gain;
     dev->vref = vref_volts>0? vref_volts:2.5;
     dev->drate_code = drate_code_from_sps(drate_sps>0?drate_sps:1000);
 
-    // STATUS: MSB first, Auto-Calibration disabled, BUFEN=1 recommended
+    // STATUS: MSB first, Auto-Calibration desabilitado, BUFEN=1 recomendado
     uint8_t status = 0x00; // 0b00000000: ORDER=0 (MSB), ACAL=0, BUFEN=0
-    // enable buffer for single-ended
+    // habilita buffer para single-ended
     status |= 0x02; // BUFEN=1
     ads1256_wreg(dev->spi_fd, ADS1256_REG_STATUS, status);
 
@@ -205,14 +219,15 @@ int ads1256_configure(ads1256_t* dev, int pga_gain, double vref_volts, int drate
     // DRATE
     ads1256_wreg(dev->spi_fd, ADS1256_REG_DRATE, dev->drate_code);
 
-    // Default MUX to AIN0-AINCOM
+    // MUX padrão para AIN0-AINCOM
     ads1256_wreg(dev->spi_fd, ADS1256_REG_MUX, (0<<4) | 0x08);
 
     return 0;
 }
 
+// Executa calibração offset/gain do sistema
 int ads1256_self_calibrate(ads1256_t* dev) {
-    // System offset/gain calibration
+    // Calibração offset/gain do sistema
     spi_write_cmd(dev->spi_fd, ADS1256_CMD_SYSOCAL);
     if (ads1256_wait_drdy(dev, 1000) != 0) return -1;
     spi_write_cmd(dev->spi_fd, ADS1256_CMD_SYSGCAL);
@@ -220,23 +235,26 @@ int ads1256_self_calibrate(ads1256_t* dev) {
     return 0;
 }
 
+// Configura o multiplexador MUX para canal específico
 static int set_mux(ads1256_t* dev, uint8_t ainp, uint8_t ainm) {
     uint8_t val = ((ainp & 0x0F) << 4) | (ainm & 0x0F);
     return ads1256_wreg(dev->spi_fd, ADS1256_REG_MUX, val);
 }
 
+// Lê uma conversão one-shot de um canal single-ended
 int ads1256_read_one_shot(ads1256_t* dev, uint8_t ainp, uint8_t ainm, int32_t* out) {
     set_mux(dev, ainp, ainm);
-    // SYNC + WAKEUP sequence for settling
+    // Sequência SYNC + WAKEUP para settling
     spi_write_cmd(dev->spi_fd, ADS1256_CMD_SYNC);
     nsleep(4*1000); // 4us min
     spi_write_cmd(dev->spi_fd, ADS1256_CMD_WAKEUP);
-    // Wait DRDY
+    // Espera DRDY
     if (ads1256_wait_drdy(dev, 1000) != 0) return -1;
     // RDATA
     return ads1256_read_data24(dev->spi_fd, out);
 }
 
+// Lê todos os 8 canais single-ended (AIN0..AIN7 vs AINCOM)
 int ads1256_read_8_single_ended(ads1256_t* dev, int32_t out_ch[8]) {
     for (int ch=0; ch<8; ++ch) {
         if (ads1256_read_one_shot(dev, (uint8_t)ch, 0x08, &out_ch[ch]) != 0) return -1; // AINCOM=8
@@ -244,10 +262,11 @@ int ads1256_read_8_single_ended(ads1256_t* dev, int32_t out_ch[8]) {
     return 0;
 }
 
-// Ring buffer implementation
+// Implementação do buffer circular
 
 typedef struct { pthread_mutex_t m; } _mtx_t;
 
+// Inicializa o buffer circular
 int ads1256_ring_init(ads1256_ring_t* r, size_t capacity) {
     memset(r, 0, sizeof(*r));
     r->buf = (ads1256_frame_t*)calloc(capacity, sizeof(ads1256_frame_t));
@@ -260,6 +279,7 @@ int ads1256_ring_init(ads1256_ring_t* r, size_t capacity) {
     return 0;
 }
 
+// Libera o buffer circular
 void ads1256_ring_free(ads1256_ring_t* r) {
     if (!r) return;
     if (r->buf) free(r->buf);
@@ -267,15 +287,17 @@ void ads1256_ring_free(ads1256_ring_t* r) {
     memset(r, 0, sizeof(*r));
 }
 
+// Empurra um frame no buffer (sobrescreve se cheio)
 void ads1256_ring_push(ads1256_ring_t* r, const ads1256_frame_t* f) {
     _mtx_t* m = (_mtx_t*)r->mtx;
     pthread_mutex_lock(&m->m);
     r->buf[r->head] = *f;
     r->head = (r->head + 1) % r->capacity;
-    if (r->count < r->capacity) r->count++; // overwrite when full
+    if (r->count < r->capacity) r->count++; // sobrescreve quando cheio
     pthread_mutex_unlock(&m->m);
 }
 
+// Pop um frame do buffer (retorna 0 se vazio)
 int ads1256_ring_pop(ads1256_ring_t* r, ads1256_frame_t* out) {
     _mtx_t* m = (_mtx_t*)r->mtx;
     pthread_mutex_lock(&m->m);
