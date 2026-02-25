@@ -2,6 +2,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 // Função da thread do sampler: lê frames continuamente e os empurra no buffer circular
@@ -12,7 +13,9 @@ static void* sampler_thread(void* arg) {
         if (ads1256_read_8_single_ended(&s->dev, ch) == 0) { // Lê os 8 canais
             ads1256_frame_t f = {0}; // Cria um novo frame
             for (int i=0;i<8;++i) f.ch[i]=ch[i]; // Copia os valores dos canais
-            f.t_ns = 0; // Timestamp preenchido por ads1256.c se desejado; aqui mantemos 0
+            struct timespec _ts;
+            clock_gettime(CLOCK_MONOTONIC, &_ts);
+            f.t_ns = (uint64_t)_ts.tv_sec * 1000000000ULL + _ts.tv_nsec;
             ads1256_ring_push(&s->ring, &f); // Empurra o frame no buffer circular
         } else {
             // Pequeno atraso em caso de erro
