@@ -96,7 +96,7 @@ int main(int argc, char** argv){
 
     // Iniciar o sampler
     sampler_t s;
-    if (sampler_start(&s, spi, speed, chip, drdy, reset, pga, vref, drate, 256) != 0) {
+    if (sampler_start(&s, spi, speed, chip, drdy, reset, pga, vref, drate, 100) != 0) {
         fprintf(stderr, "Falha ao iniciar sampler. SPI e libgpiod disponíveis?\n");
         return 1;
     }
@@ -120,15 +120,15 @@ int main(int argc, char** argv){
     }
     printf("Socket UDP pronto para enviar para %s:%d\n", udp_host, port);
 
-    // Agrupar 100 frames por pacote
-    const int FRAMES_PER_PACKET = 100;
+    // Agrupar 20 frames por pacote (20 x 16 bytes = 320 bytes de dados)
+    const int FRAMES_PER_PACKET = 20;
     const int HEADER_SIZE = sizeof(packet_header_t);
     size_t data_bytes = (size_t)FRAMES_PER_PACKET * 8 * sizeof(int16_t);
     size_t packet_bytes = HEADER_SIZE + data_bytes;
     int remaining = frames;
 
     int running = 1;
-    // Alocar buffer para header + amostras convertidas (100 frames)
+    // Alocar buffer para header + amostras convertidas (20 frames)
     uint8_t *packet_buf = malloc(packet_bytes);
     if (!packet_buf) {
         fprintf(stderr, "Falha ao alocar buffer de pacote\n");
@@ -159,7 +159,7 @@ int main(int argc, char** argv){
         frames_in_buffer++;
         if (frames != 0) remaining--;
 
-        // Se buffer cheio (100 frames), enviar pacote
+        // Se buffer cheio (20 frames = 320 bytes de dados), enviar pacote UDP
         if (frames_in_buffer >= FRAMES_PER_PACKET) {
             // Preencher header
             packet_header_t *hdr = (packet_header_t*)packet_buf;
@@ -178,8 +178,6 @@ int main(int argc, char** argv){
             frames_in_buffer = 0; // resetar buffer
         }
 
-        // Esperar 10ms por frame para preservar cadência
-        usleep(10000);
         if (!running) break;
     }
 
